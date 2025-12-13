@@ -4,6 +4,8 @@ Barebones RAW converter for research or DaVinci Resolve workflows.
 
 Simple Python tool based on libraw for converting RAW/DNG/Linear DNG files to linear XYZ or ACES AP1/ACEScct 16-bit TIFFs.
 
+Linear DNG support is handy for raw-preprocessors like DxO PureRaw which does optical and AI noise corrections
+
 ## Features
 
 - **Minimal dependencies**: Built on rawpy (LibRaw), NumPy, and colour-science
