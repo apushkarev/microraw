@@ -103,9 +103,10 @@ Custom profiles are JSON files containing:
 
 Currently included custom profiles:
 
-1. Nikon Z f, Z6II, Z5II, Z6
-2. Olympus Stylus 1
-3. Leica M9
+1. Nikon Z f, Z6II, Z5II (nzf.json)
+2. Nikon Z6 (nz6.json)
+2. Olympus Stylus 1 (os1.json)
+3. Leica M9 (lm9.json)
 
 ### Example Profile Format
 
