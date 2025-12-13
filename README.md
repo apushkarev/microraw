@@ -101,6 +101,12 @@ Custom profiles are JSON files containing:
 1. **ForwardMatrix** (required): 3x3 matrix for Camera RGB → XYZ (D50) conversion
 2. **linearDngCorrection** (optional): 3-element vector `[R, G, B]` for Linear DNG correction
 
+Currently included custom profiles:
+
+1. Nikon Z f, Z6II, Z5II, Z6
+2. Olympus Stylus 1
+3. Leica M9
+
 ### Example Profile Format
 
 ```json
