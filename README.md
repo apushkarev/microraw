@@ -161,6 +161,7 @@ For pre-demosaiced Linear DNGs:
 2. Set **Input Color Space**: `ACES (AP1)`
 3. Set **Input Gamma**: `ACEScct`
 4. **Important**: Disable "Apply Forward OOTF" in Color Space Transform nodes
+5. I prefer to disable "Use White Point Adaptation" option
 
 ## Troubleshooting
 
