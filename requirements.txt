@@ -1,0 +1,6 @@
+numpy>=2.0.0
+rawpy>=0.18.0
+tifffile>=2023.0.0
+colour-science>=0.4.3
+scipy>=1.13.0
+matplotlib>=3.9.0
