@@ -177,9 +177,9 @@ For pre-demosaiced Linear DNGs:
 - **White Balance**: Applied by multiplying camera RGB by WB multipliers
 - **Demosaic Algorithm**: AHD (Adaptive Homogeneity-Directed)
 - **Color Primaries**: 
-  - XYZ: CIE 1931 (D50 illuminant)
-  - ACES: AP1 working space (D60 illuminant)
-- **Log Encoding**: ACEScct (with linear toe for shadow preservation)
+  - XYZ: CIE 1931
+  - ACES: AP1 working space
+- **Log Encoding**: ACEScct
 - **Bit Depth**: 16-bit unsigned integer output
 
 ## License
