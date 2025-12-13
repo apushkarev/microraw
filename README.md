@@ -23,7 +23,7 @@ Linear DNG support is handy for raw-preprocessors like DxO PureRaw which does op
 - **Operating System**: macOS, Linux, or Windows
 
 ## Installation
-
+0. Best to ask AI agent to do this
 1. Clone or download this repository
 2. Create a virtual environment (recommended):
    ```bash
