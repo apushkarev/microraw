@@ -153,12 +153,12 @@ For pre-demosaiced Linear DNGs:
 
 ### XYZ Files
 1. Import TIFF
-2. Set **Input Color Space**: `CIE-XYZ D50`
+2. Set **Input Color Space**: `XYZ (CIE)`
 3. Set **Input Gamma**: `Linear`
 
 ### ACES Files
 1. Import TIFF
-2. Set **Input Color Space**: `ACEScct`
+2. Set **Input Color Space**: `ACES (AP1)`
 3. Set **Input Gamma**: `ACEScct`
 4. **Important**: Disable "Apply Forward OOTF" in Color Space Transform nodes
 
