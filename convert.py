@@ -241,28 +241,45 @@ Examples:
     input_path_obj = Path(input_path)
     
     if input_path_obj.is_dir():
-        # Process all DNG files in the folder
-        dng_files = sorted(input_path_obj.glob('*.dng')) + sorted(input_path_obj.glob('*.DNG'))
+        # Process all RAW files in the folder
+        # Common RAW extensions from various manufacturers
+        raw_extensions = [
+            '*.dng', '*.DNG',  # Adobe/Generic
+            '*.nef', '*.NEF',  # Nikon
+            '*.cr2', '*.CR2', '*.cr3', '*.CR3',  # Canon
+            '*.arw', '*.ARW',  # Sony
+            '*.orf', '*.ORF',  # Olympus
+            '*.rw2', '*.RW2',  # Panasonic
+            '*.pef', '*.PEF',  # Pentax
+            '*.raf', '*.RAF',  # Fujifilm
+            '*.raw', '*.RAW',  # Generic
+            '*.rwl', '*.RWL',  # Leica
+        ]
         
-        if not dng_files:
-            print(f"Error: No DNG files found in folder {input_path}")
+        raw_files = []
+        for pattern in raw_extensions:
+            raw_files.extend(input_path_obj.glob(pattern))
+        raw_files = sorted(raw_files)
+        
+        if not raw_files:
+            print(f"Error: No RAW files found in folder {input_path}")
             sys.exit(1)
         
-        print(f"\nFound {len(dng_files)} DNG file(s) in folder")
+        print(f"\nFound {len(raw_files)} RAW file(s) in folder")
         print("="*60)
         
-        for i, dng_path in enumerate(dng_files, 1):
-            print(f"\n[{i}/{len(dng_files)}] Processing {dng_path.name}")
-            output_path = dng_path.parent / f"{dng_path.stem}_{target_colorspace}.tiff"
+        for i, raw_path in enumerate(raw_files, 1):
+            print(f"\n[{i}/{len(raw_files)}] Processing {raw_path.name}")
+            output_path = raw_path.parent / f"{raw_path.stem}_{target_colorspace}.tiff"
             
             try:
                 use_libraw = (inverted_matrix is None)
-                output_image = process_raw_image(str(dng_path), inverted_matrix, target_colorspace, linear_dng_correction, apply_wb=True, use_libraw_xyz=use_libraw)
+                output_image = process_raw_image(str(raw_path), inverted_matrix, target_colorspace, linear_dng_correction, apply_wb=True, use_libraw_xyz=use_libraw)
                 print(f"  Saving to {output_path.name}")
                 tifffile.imwrite(str(output_path), output_image)
                 print(f"  ✓ Completed")
             except Exception as e:
-                print(f"  ✗ Error processing {dng_path.name}: {e}")
+                print(f"  ✗ Error processing {raw_path.name}: {e}")
                 continue
         
         print("\n" + "="*60)
