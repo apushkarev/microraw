@@ -19,7 +19,7 @@ Linear DNG support is handy for raw-preprocessors like DxO PureRaw which does op
 
 ## Requirements
 
-- **Python**: 3.11 or later
+- **Python**: 3.11-3.13 (not 3.14 yet)
 - **Operating System**: macOS, Linux, or Windows
 
 ## Installation
