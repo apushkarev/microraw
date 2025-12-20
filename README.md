@@ -98,8 +98,7 @@ All outputs are 16-bit uncompressed TIFFs.
 
 Custom profiles are JSON files containing:
 
-1. **ForwardMatrix** (required): 3x3 matrix for Camera RGB → XYZ (D50) conversion
-2. **linearDngCorrection** (optional): 3-element vector `[R, G, B]` for Linear DNG correction
+**ForwardMatrix** (required): 3x3 matrix for Camera RGB → XYZ (D50) conversion
 
 Currently included custom profiles:
 
@@ -116,8 +115,7 @@ Currently included custom profiles:
     [0.796100, 0.209700, -0.041500],
     [0.313400, 1.002200, -0.315600],
     [0.032300, -0.204400, 0.997300]
-  ],
-  "linearDngCorrection": [0.958865, 1.941213, 1.630617]
+  ]
 }
 ```
 
@@ -125,8 +123,7 @@ Currently included custom profiles:
 
 1. create own DCP profile (lumariver, argyll+dcamprof)
 2. Extract ForwardMatrix from the DCP file (dcpTool -d) *
-3. (Optional) Calculate linearDngCorrection vector using ColorChecker measurements
-4. Save as JSON in the `ref/` folder
+3. Save as JSON in the `ref/` folder
 
 * note forward matrix coefficients in dcp are saved in reverse order and in forward order in json profile
 
@@ -142,10 +139,9 @@ Currently included custom profiles:
 ### Custom Matrix Mode (`--matrix path/to/json`)
 
 1. Demosaic Bayer → Camera RGB
-2. Apply camera white balance (multiply by WB multipliers)
-3. Apply linearDngCorrection (if present in JSON)
-4. Apply ForwardMatrix: Camera RGB → XYZ (D50)
-5. (Optional) Convert XYZ → ACES AP1/ACEScct:
+2. Apply camera white balance/black point by libraw
+3. Apply ForwardMatrix: Camera RGB → XYZ (D50)
+4. (Optional) Convert XYZ → ACES AP1/ACEScct:
    - Chromatic adaptation: D50 → D60 (Bradford)
    - Convert to AP1 primaries
    - Apply ACEScct log encoding
@@ -154,9 +150,8 @@ Currently included custom profiles:
 
 For pre-demosaiced Linear DNGs:
 1. Read RGB data directly (no demosaic needed)
-2. Apply linearDngCorrection vector
-3. Apply ForwardMatrix: RGB → XYZ (D50)
-4. Continue with color space conversion if needed
+2. Apply ForwardMatrix: RGB → XYZ (D50)
+3. Continue with color space conversion if needed
 
 ## Using Output in DaVinci Resolve
 
