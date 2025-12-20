@@ -124,34 +124,44 @@ def process_raw(raw_path, forward_matrix=None, colorspace='xyz', output_dir=None
                 # Fallback to postprocessing
                 is_linear_dng = False
         
-        # Let LibRaw apply camera white balance internally
-        print(f"  Demosaic + LibRaw WB...")
-        rgb16 = raw.postprocess(
-            use_camera_wb=True,
-            use_auto_wb=False,
-            output_color=rawpy.ColorSpace.raw,
-            output_bps=16,
-            gamma=(1, 1),
-            no_auto_bright=True,
-            user_flip=0
-        )
-        rgb_image = rgb16.astype(np.float64) / 65535.0
-        
-        # Get camera to XYZ matrix
+        # Process based on matrix mode
         if forward_matrix is not None:
+            # Custom matrix mode: demosaic to camera RGB, apply WB, then custom matrix
+            print(f"  Demosaic + LibRaw WB...")
+            rgb16 = raw.postprocess(
+                use_camera_wb=True,
+                use_auto_wb=False,
+                output_color=rawpy.ColorSpace.raw,
+                output_bps=16,
+                gamma=(1, 1),
+                no_auto_bright=True,
+                user_flip=0
+            )
+            rgb_image = rgb16.astype(np.float64) / 65535.0
+            
             # Use custom forward matrix
             cam_to_xyz = forward_matrix
             print(f"  Using custom forward matrix")
+            
+            # Apply forward matrix: Camera RGB -> XYZ D50
+            shape = rgb_image.shape
+            rgb_flat = rgb_image.reshape(-1, 3)
+            xyz_flat = rgb_flat @ cam_to_xyz.T
+            xyz_image = xyz_flat.reshape(shape)
         else:
-            # Use LibRaw's built-in matrix
-            cam_to_xyz = raw.rgb_xyz_matrix[:3, :3]
-            print(f"  Using built-in camera matrix")
-        
-        # Apply forward matrix: Camera RGB -> XYZ D50
-        shape = rgb_image.shape
-        rgb_flat = rgb_image.reshape(-1, 3)
-        xyz_flat = rgb_flat @ cam_to_xyz.T
-        xyz_image = xyz_flat.reshape(shape)
+            # Default matrix mode: let LibRaw do the full conversion to XYZ
+            print(f"  LibRaw demosaic + WB + XYZ conversion...")
+            xyz16 = raw.postprocess(
+                use_camera_wb=True,
+                use_auto_wb=False,
+                output_color=rawpy.ColorSpace.XYZ,
+                output_bps=16,
+                gamma=(1, 1),
+                no_auto_bright=True,
+                user_flip=0
+            )
+            xyz_image = xyz16.astype(np.float64) / 65535.0
+            print(f"  Using LibRaw built-in camera matrix")
         
         # Clip negative values
         xyz_image = np.clip(xyz_image, 0, None)
