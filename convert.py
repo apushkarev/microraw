@@ -129,7 +129,7 @@ def process_raw(raw_path, forward_matrix=None, colorspace='xyz', output_dir=None
             # Custom matrix mode: demosaic to camera RGB, apply WB, then custom matrix
             print(f"  Demosaic + LibRaw WB...")
             rgb16 = raw.postprocess(
-                use_camera_wb=True,
+                use_camera_wb=not is_linear_dng,
                 use_auto_wb=False,
                 output_color=rawpy.ColorSpace.raw,
                 output_bps=16,
