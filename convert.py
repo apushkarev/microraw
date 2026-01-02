@@ -128,9 +128,11 @@ def process_raw(raw_path, forward_matrix=None, colorspace='xyz', output_dir=None
         if forward_matrix is not None:
             # Custom matrix mode: demosaic to camera RGB, apply WB, then custom matrix
             print(f"  Demosaic + LibRaw WB...")
+
             # Set user_sat higher to preserve highlights after WB multiplication
             # WB can push values beyond white_level, use 4x headroom
-            user_sat = int(raw.white_level * 4)
+            
+            # user_sat = int(raw.white_level * 4)
             rgb16 = raw.postprocess(
                 use_camera_wb=True,
                 use_auto_wb=False,
@@ -138,8 +140,8 @@ def process_raw(raw_path, forward_matrix=None, colorspace='xyz', output_dir=None
                 output_bps=16,
                 gamma=(1, 1),
                 no_auto_bright=True,
-                adjust_maximum_thr=0.0,
-                user_sat=user_sat,
+                # adjust_maximum_thr=0.0,
+                # user_sat=user_sat,
                 user_flip=0
             )
             rgb_image = rgb16.astype(np.float64) / 65535.0
@@ -157,7 +159,7 @@ def process_raw(raw_path, forward_matrix=None, colorspace='xyz', output_dir=None
             # Default matrix mode: let LibRaw do the full conversion to XYZ
             print(f"  LibRaw demosaic + WB + XYZ conversion...")
             # Set user_sat higher to preserve highlights after WB multiplication
-            user_sat = int(raw.white_level * 4)
+            # user_sat = int(raw.white_level * 4)
             xyz16 = raw.postprocess(
                 use_camera_wb=True,
                 use_auto_wb=False,
@@ -165,8 +167,8 @@ def process_raw(raw_path, forward_matrix=None, colorspace='xyz', output_dir=None
                 output_bps=16,
                 gamma=(1, 1),
                 no_auto_bright=True,
-                adjust_maximum_thr=0.0,
-                user_sat=user_sat,
+                # adjust_maximum_thr=0.0,
+                # user_sat=user_sat,
                 user_flip=0
             )
             xyz_image = xyz16.astype(np.float64) / 65535.0
