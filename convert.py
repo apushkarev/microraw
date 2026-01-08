@@ -131,7 +131,7 @@ def process_raw(raw_path, forward_matrix=None, colorspace='xyz', output_dir=None
 
             # Set user_sat higher to preserve highlights after WB multiplication
             # WB can push values beyond white_level, use 4x headroom
-            
+
             # user_sat = int(raw.white_level * 4)
             rgb16 = raw.postprocess(
                 use_camera_wb=True,
@@ -203,8 +203,9 @@ def process_raw(raw_path, forward_matrix=None, colorspace='xyz', output_dir=None
         # Convert to 16-bit
         # Don't clip upper values - both ACES (log-encoded) and XYZ (linear HDR) can exceed 1.0
         # Only clip negative values to 0
-        output_scaled = output_image * 65535
-        output_16bit = np.clip(output_scaled, 0, None).astype(np.uint16)
+        # output_scaled = output_image * 65535
+        # output_16bit = np.clip(output_scaled, 0, None).astype(np.uint16)
+        output_16bit = np.clip(output_image * 65535, 0, 65535).astype(np.uint16)
         
         # Build output filename: original_name + matrix_name + colorspace
         output_suffix = f"_{matrix_name}_{colorspace}"
