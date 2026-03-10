@@ -21,13 +21,286 @@ import colour
 from colour import CCS_ILLUMINANTS, RGB_COLOURSPACES, xy_to_XYZ
 from colour.models import log_encoding_ACEScct
 from colour.adaptation import matrix_chromatic_adaptation_VonKries
+from colour.algebra import table_interpolation_tetrahedral
+from colour import CCS_ILLUMINANTS, xy_to_XYZ
+
+
+def load_profile(matrix_path):
+    """
+    Load profile JSON. Returns the parsed profile dict.
+    Supports both new multi-illuminant format {"illuminants": [...]}
+    and legacy single-illuminant format {"forwardMatrix": ..., "jzazlut": ...}.
+    Always returns a dict with an "illuminants" list.
+    """
+    with open(matrix_path, 'r') as f:
+        profile = json.load(f)
+
+    if 'illuminants' not in profile:
+        # Legacy format: wrap in new structure using D50 CCT (5003K)
+        profile = {
+            'illuminants': [{
+                'cct': 5003,
+                'label': 'D50',
+                'forwardMatrix': profile['forwardMatrix'],
+                'jzazlut': profile.get('jzazlut'),
+            }]
+        }
+
+    return profile
 
 
 def load_forward_matrix(matrix_path):
-    """Load forward matrix from JSON profile"""
-    with open(matrix_path, 'r') as f:
-        profile = json.load(f)
-    return np.array(profile['forwardMatrix'])
+    """Load forward matrix from JSON profile (backward-compatible, uses first entry)."""
+    profile = load_profile(matrix_path)
+    fm = np.array(profile['illuminants'][0]['forwardMatrix'])
+    return fm
+
+
+# DNG CalibrationIlluminant tag values → CCT in Kelvin
+_DNG_ILLUMINANT_CCT = {
+    1: 5503,   # Daylight (approximate D55)
+    2: 3800,   # Fluorescent (approximate)
+    3: 2856,   # Tungsten
+    17: 2856,  # Standard Light A
+    18: 4874,  # Standard Light B
+    19: 6774,  # Standard Light C
+    20: 5503,  # D55
+    21: 6504,  # D65
+    22: 7504,  # D75
+    23: 5003,  # D50
+    24: 3200,  # ISO studio tungsten
+}
+
+
+def _parse_dng_rationals(values, cols=3):
+    """Parse DNG SRATIONAL tag (flat num/den pairs) into a numpy array."""
+    floats = [values[i] / values[i + 1] for i in range(0, len(values), 2)]
+    rows = len(floats) // cols
+    return np.array(floats).reshape(rows, cols)
+
+
+def _estimate_cct_dng(raw_path):
+    """
+    Estimate scene CCT from DNG ColorMatrix1/2 + AsShotNeutral tags.
+    Uses iterative matrix interpolation in mired space (per DNG spec).
+    Returns CCT in Kelvin, or None if DNG tags are missing.
+    """
+    try:
+        with tifffile.TiffFile(str(raw_path)) as tif:
+            tags = tif.pages[0].tags
+
+            if 50721 not in tags or 50728 not in tags:
+                return None
+
+            cm1 = _parse_dng_rationals(tags[50721].value)
+            neutral = _parse_dng_rationals(tags[50728].value, cols=1).flatten()
+
+            # Single-matrix DNG: solve directly
+            if 50722 not in tags:
+                xyz = np.linalg.solve(cm1, neutral)
+                xy = xyz[:2] / xyz.sum()
+                return float(colour.xy_to_CCT(xy, method='Hernandez 1999'))
+
+            cm2 = _parse_dng_rationals(tags[50722].value)
+
+            ci1_tag = tags.get(50778)
+            ci2_tag = tags.get(50779)
+            cct_lo = _DNG_ILLUMINANT_CCT.get(ci1_tag.value if ci1_tag else 17, 2856)
+            cct_hi = _DNG_ILLUMINANT_CCT.get(ci2_tag.value if ci2_tag else 21, 6504)
+
+            mired_lo = 1e6 / cct_lo
+            mired_hi = 1e6 / cct_hi
+
+            # Seed from CM1
+            xyz = np.linalg.solve(cm1, neutral)
+            xy = xyz[:2] / xyz.sum()
+            cct = float(colour.xy_to_CCT(xy, method='Hernandez 1999'))
+
+            # Iterate: blend matrices in mired space until CCT converges
+            for _ in range(4):
+                mired = 1e6 / max(cct, 1000)
+                w = np.clip((mired - mired_lo) / (mired_hi - mired_lo), 0, 1)
+                cm = (1 - w) * cm1 + w * cm2
+
+                xyz = np.linalg.solve(cm, neutral)
+                xy = xyz[:2] / xyz.sum()
+                cct = float(colour.xy_to_CCT(xy, method='Hernandez 1999'))
+
+            return cct
+
+    except Exception:
+        return None
+
+
+def _estimate_cct_rawpy(raw):
+    """
+    Fallback CCT estimation for non-DNG raws using rawpy.
+    Less accurate than the DNG approach (rawpy's color_matrix is libraw's
+    internal matrix, not the original DNG ColorMatrix).
+    """
+    try:
+        wb = np.array(raw.camera_whitebalance[:3], dtype=float)
+        cm = raw.color_matrix[:3, :3].astype(float)
+
+        neutral = 1.0 / (wb / wb[1])
+
+        xyz_white = np.linalg.solve(cm, neutral)
+        xy = xyz_white[:2] / xyz_white.sum()
+
+        return float(colour.xy_to_CCT(xy, method='Hernandez 1999'))
+
+    except Exception:
+        return None
+
+
+def estimate_scene_cct(raw, raw_path=None):
+    """
+    Estimate scene CCT. Tries DNG tags via tifffile first (accurate),
+    falls back to rawpy (less accurate for non-DNG raws).
+    Returns CCT in Kelvin, or None if estimation fails.
+    """
+    if raw_path is not None:
+        cct = _estimate_cct_dng(raw_path)
+        if cct is not None:
+            return cct
+
+    return _estimate_cct_rawpy(raw)
+
+
+def interpolate_for_cct(illuminants, cct):
+    """
+    Given a sorted list of illuminant dicts and a scene CCT,
+    return (fm, jzazlut_lo, jzazlut_hi, weight) where weight blends lo→hi.
+    weight=0 means use lo only, weight=1 means use hi only.
+    Clamps to nearest if CCT is outside the profile range.
+    """
+    ccts = [e['cct'] for e in illuminants]
+
+    if cct <= ccts[0]:
+        e = illuminants[0]
+        return np.array(e['forwardMatrix']), e.get('jzazlut'), None, 0.0
+
+    if cct >= ccts[-1]:
+        e = illuminants[-1]
+        return np.array(e['forwardMatrix']), e.get('jzazlut'), None, 0.0
+
+    # Find bracketing entries
+    hi_idx = next(i for i, c in enumerate(ccts) if c >= cct)
+    lo_idx = hi_idx - 1
+
+    lo = illuminants[lo_idx]
+    hi = illuminants[hi_idx]
+
+    # Inverse-CCT (mired) interpolation weight
+    inv_lo  = 1.0 / lo['cct']
+    inv_hi  = 1.0 / hi['cct']
+    inv_cct = 1.0 / cct
+
+    weight = (inv_cct - inv_lo) / (inv_hi - inv_lo)
+    weight = float(np.clip(weight, 0.0, 1.0))
+
+    fm_lo = np.array(lo['forwardMatrix'])
+    fm_hi = np.array(hi['forwardMatrix'])
+    fm = (1.0 - weight) * fm_lo + weight * fm_hi
+
+    return fm, lo.get('jzazlut'), hi.get('jzazlut'), weight
+
+
+def _normalize_jab(jab, domain):
+    """Map JzAzBz to [0, 1]³ using domain bounds. Accepts (N, 3) or (H, W, 3)."""
+
+    norm = np.empty_like(jab)
+
+    norm[..., 0] = jab[..., 0] / domain['jz'][1]
+
+    az_range = domain['az'][1] - domain['az'][0]
+    norm[..., 1] = (jab[..., 1] - domain['az'][0]) / az_range
+
+    bz_range = domain['bz'][1] - domain['bz'][0]
+    norm[..., 2] = (jab[..., 2] - domain['bz'][0]) / bz_range
+
+    return norm
+
+
+def _denormalize_jab(norm, domain):
+    """Map [0, 1]³ back to JzAzBz using domain bounds. Accepts (N, 3) or (H, W, 3)."""
+
+    jab = np.empty_like(norm)
+
+    jab[..., 0] = norm[..., 0] * domain['jz'][1]
+
+    az_range = domain['az'][1] - domain['az'][0]
+    jab[..., 1] = norm[..., 1] * az_range + domain['az'][0]
+
+    bz_range = domain['bz'][1] - domain['bz'][0]
+    jab[..., 2] = norm[..., 2] * bz_range + domain['bz'][0]
+
+    return jab
+
+
+def apply_jzazbz_lut_blended(xyz_image, jzazlut_lo, jzazlut_hi, weight, profile_dir):
+    """
+    Apply JzAzBz LUT correction with optional blending between two illuminant LUTs.
+
+    If jzazlut_hi is None or weight==0, applies jzazlut_lo only.
+    Otherwise applies both and blends: (1-w)*lo + w*hi.
+    """
+    corrected_lo = apply_jzazbz_lut(xyz_image, jzazlut_lo, profile_dir)
+
+    if jzazlut_hi is None or weight == 0.0:
+        return corrected_lo
+
+    if weight == 1.0:
+        return apply_jzazbz_lut(xyz_image, jzazlut_hi, profile_dir)
+
+    corrected_hi = apply_jzazbz_lut(xyz_image, jzazlut_hi, profile_dir)
+
+    return (1.0 - weight) * corrected_lo + weight * corrected_hi
+
+
+def apply_jzazbz_lut(xyz_image, jzazlut_config, profile_dir):
+    """
+    Apply JzAzBz LUT correction to an XYZ image (Y=1 for white).
+
+    xyz_image:      ndarray shape (H, W, 3) or (N, 3)
+    jzazlut_config: dict with keys 'file', 'reference_luminance', 'domain'
+    profile_dir:    Path — directory containing the .cube file
+    """
+    ref_lum = jzazlut_config['reference_luminance']
+    domain  = jzazlut_config['domain']
+
+    cube_path = Path(profile_dir) / jzazlut_config['file']
+    lut = colour.read_LUT(str(cube_path))
+
+    # Bradford CAT matrices: D50 ↔ D65
+    # JzAzBz neutral axis aligns with D65; our XYZ is D50-adapted.
+    _obs = 'CIE 1931 2 Degree Standard Observer'
+    _d50 = xy_to_XYZ(CCS_ILLUMINANTS[_obs]['D50'])
+    _d65 = xy_to_XYZ(CCS_ILLUMINANTS[_obs]['D65'])
+    cat_d50_to_d65 = matrix_chromatic_adaptation_VonKries(_d50, _d65, transform='Bradford')
+    cat_d65_to_d50 = matrix_chromatic_adaptation_VonKries(_d65, _d50, transform='Bradford')
+
+    orig_shape = xyz_image.shape
+    xyz_flat = xyz_image.reshape(-1, 3)
+
+    # D50 → D65, then absolute XYZ → JzAzBz
+    xyz_d65 = xyz_flat @ cat_d50_to_d65.T
+    jab = colour.XYZ_to_Jzazbz(xyz_d65 * ref_lum)
+
+    # Normalize to [0, 1], clip out-of-gamut
+    norm = _normalize_jab(jab, domain)
+    norm = np.clip(norm, 0.0, 1.0)
+
+    # Apply LUT via tetrahedral interpolation
+    corrected_norm = lut.apply(norm, interpolator=table_interpolation_tetrahedral)
+    corrected_norm = np.clip(corrected_norm, 0.0, 1.0)
+
+    # Denormalize → JzAzBz → absolute XYZ → D65 → D50
+    corrected_jab = _denormalize_jab(corrected_norm, domain)
+    corrected_d65 = colour.Jzazbz_to_XYZ(corrected_jab) / ref_lum
+    corrected_xyz = corrected_d65 @ cat_d65_to_d50.T
+
+    return corrected_xyz.reshape(orig_shape)
 
 def convert_xyz_to_aces_ap1_acescct(xyz):
     """Convert XYZ (D50) to ACES AP1 with ACEScct log encoding.
@@ -70,69 +343,83 @@ def convert_xyz_to_aces_ap1_acescct(xyz):
         return ap1_cct_flat
 
 
-def process_raw(raw_path, forward_matrix=None, colorspace='xyz', output_dir=None, matrix_name='default'):
+def process_raw(raw_path, profile=None, scene_cct=None,
+                colorspace='xyz', output_dir=None, matrix_name='default'):
     """
-    Process a single RAW file
-    
+    Process a single RAW file.
+
     Args:
-        raw_path: Path to RAW file
-        forward_matrix: Custom 3x3 forward matrix (Camera RGB -> XYZ D50), or None for default
-        colorspace: 'xyz' or 'aces'
-        output_dir: Output directory (if None, use same as input)
+        raw_path:    Path to RAW file
+        profile:     Parsed profile dict with 'illuminants' list, or None for default LibRaw
+        scene_cct:   Override scene CCT in Kelvin. If None, estimated from raw metadata.
+        colorspace:  'xyz' or 'aces'
+        output_dir:  Output directory (if None, use same as input)
         matrix_name: Name of matrix profile (without extension)
     """
     raw_path = Path(raw_path)
-    
+
     if output_dir is None:
         output_dir = raw_path.parent
     else:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     print(f"Processing: {raw_path.name}")
-    
+
     # Open RAW file
     with rawpy.imread(str(raw_path)) as raw:
+
+        # Resolve FM and LUT from multi-illuminant profile
+        if profile is not None:
+            illuminants = profile['illuminants']
+            profile_dir = profile.get('_dir')
+
+            if scene_cct is None:
+                scene_cct = estimate_scene_cct(raw, raw_path)
+                if scene_cct is not None:
+                    print(f"  Estimated scene CCT: {scene_cct:.0f} K")
+                else:
+                    scene_cct = illuminants[0]['cct']
+                    print(f"  Could not estimate CCT, using {scene_cct} K")
+            else:
+                print(f"  Scene CCT (manual override): {scene_cct:.0f} K")
+
+            forward_matrix, jzazlut_lo, jzazlut_hi, lut_weight = interpolate_for_cct(illuminants, scene_cct)
+            print(f"  Interpolated FM + LUT for {scene_cct:.0f} K (weight={lut_weight:.3f})")
+
+        else:
+            forward_matrix = None
+            jzazlut_lo     = None
+            jzazlut_hi     = None
+            lut_weight     = 0.0
+            profile_dir    = None
+
         # Check if it's a linear DNG (already demosaiced)
-        # Linear DNGs have raw_pattern == None or raw_colors_visible > raw_colors
         is_linear_dng = False
         try:
-            # Multiple ways to detect linear DNG
             if raw.raw_pattern is None or len(raw.raw_pattern.shape) == 0:
                 is_linear_dng = True
-            elif raw.num_colors > 3:  # More than 3 color planes usually means Bayer
+            elif raw.num_colors > 3:
                 is_linear_dng = False
             elif hasattr(raw, 'sizes') and raw.sizes.raw_width == raw.sizes.width * 3:
                 is_linear_dng = True
-        except:
+        except Exception:
             pass
-        
+
         if is_linear_dng:
-            # Linear DNG - already demosaiced
             print(f"  Detected linear DNG (pre-demosaiced)")
             try:
-                # Try to get RGB image directly
                 rgb_image = raw.raw_image_visible.astype(np.float64)
-                
-                # Reshape if needed (some linear DNGs are flat)
                 if len(rgb_image.shape) == 2:
                     h, w = rgb_image.shape
                     if w % 3 == 0:
                         rgb_image = rgb_image.reshape((h, w // 3, 3))
-                        rgb_image = rgb_image.astype(np.float64)
-            except:
-                # Fallback to postprocessing
+            except Exception:
                 is_linear_dng = False
-        
+
         # Process based on matrix mode
         if forward_matrix is not None:
-            # Custom matrix mode: demosaic to camera RGB, apply WB, then custom matrix
             print(f"  Demosaic + LibRaw WB...")
-
-            # Set user_sat higher to preserve highlights after WB multiplication
-            # WB can push values beyond white_level, use 4x headroom
-
-            # user_sat = int(raw.white_level * 4)
             rgb16 = raw.postprocess(
                 use_camera_wb=True,
                 use_auto_wb=False,
@@ -140,26 +427,17 @@ def process_raw(raw_path, forward_matrix=None, colorspace='xyz', output_dir=None
                 output_bps=16,
                 gamma=(1, 1),
                 no_auto_bright=True,
-                # adjust_maximum_thr=0.0,
-                # user_sat=user_sat,
                 user_flip=0
             )
             rgb_image = rgb16.astype(np.float64) / 65535.0
-            
-            # Use custom forward matrix
-            cam_to_xyz = forward_matrix
-            print(f"  Using custom forward matrix")
-            
-            # Apply forward matrix: Camera RGB -> XYZ D50
-            shape = rgb_image.shape
-            rgb_flat = rgb_image.reshape(-1, 3)
-            xyz_flat = rgb_flat @ cam_to_xyz.T
+
+            print(f"  Using interpolated forward matrix")
+            shape    = rgb_image.shape
+            xyz_flat = rgb_image.reshape(-1, 3) @ forward_matrix.T
             xyz_image = xyz_flat.reshape(shape)
+
         else:
-            # Default matrix mode: let LibRaw do the full conversion to XYZ
             print(f"  LibRaw demosaic + WB + XYZ conversion...")
-            # Set user_sat higher to preserve highlights after WB multiplication
-            # user_sat = int(raw.white_level * 4)
             xyz16 = raw.postprocess(
                 use_camera_wb=True,
                 use_auto_wb=False,
@@ -167,16 +445,19 @@ def process_raw(raw_path, forward_matrix=None, colorspace='xyz', output_dir=None
                 output_bps=16,
                 gamma=(1, 1),
                 no_auto_bright=True,
-                # adjust_maximum_thr=0.0,
-                # user_sat=user_sat,
                 user_flip=0
             )
             xyz_image = xyz16.astype(np.float64) / 65535.0
             print(f"  Using LibRaw built-in camera matrix")
-        
-        # Clip negative values
+
         xyz_image = np.clip(xyz_image, 0, None)
-        
+
+        # Optional JzAzBz LUT correction
+        if forward_matrix is not None and jzazlut_lo is not None:
+            print(f"  Applying JzAzBz LUT correction (weight={lut_weight:.3f})...")
+            xyz_image = apply_jzazbz_lut_blended(xyz_image, jzazlut_lo, jzazlut_hi, lut_weight, profile_dir)
+            xyz_image = np.clip(xyz_image, 0, None)
+
         # Convert to target colorspace
         if colorspace == 'xyz':
             # Keep as linear XYZ D50
@@ -226,69 +507,82 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Use camera's built-in matrix, output XYZ
+  # Use camera built-in matrix
   python convert.py --matrix default --cs xyz -i photo.NEF
-  
-  # Use custom profile, output ACES
-  python convert.py --matrix ref/nz6.json --cs aces -i photo.NEF
-  
+
+  # Use multi-illuminant profile (CCT auto-detected from metadata)
+  python convert.py --matrix ref/imx226.json --cs aces -i photo.ORF
+
+  # Override CCT manually
+  python convert.py --matrix ref/imx226.json --cs aces --cct 4690 -i photo.ORF
+
   # Batch process folder
-  python convert.py --matrix ref/camera.json --cs aces -i /path/to/folder/
+  python convert.py --matrix ref/imx226.json --cs aces -i /path/to/folder/
         """
     )
-    
+
     parser.add_argument(
         '--matrix',
         required=True,
         help='Forward matrix: "default" or path to JSON profile'
     )
-    
+
     parser.add_argument(
         '--cs',
         choices=['xyz', 'aces'],
         required=True,
         help='Output colorspace: xyz (linear) or aces (AP1/ACEScct)'
     )
-    
+
     parser.add_argument(
         '-i',
         '--input',
         required=True,
         help='Input RAW file or folder'
     )
-    
+
     parser.add_argument(
         '-o',
         '--output',
         help='Output directory (default: same as input)'
     )
 
-    
+    parser.add_argument(
+        '--cct',
+        type=float,
+        default=None,
+        help='Override scene CCT in Kelvin (default: auto-detect from raw metadata)'
+    )
+
     args = parser.parse_args()
-    
-    # Load forward matrix
+
+    # Load profile
     if args.matrix.lower() == 'default':
-        forward_matrix = None
+        profile     = None
         matrix_name = 'default'
     else:
         matrix_path = Path(args.matrix)
         if not matrix_path.exists():
             print(f"Error: Matrix file not found: {matrix_path}", file=sys.stderr)
             sys.exit(1)
-        forward_matrix = load_forward_matrix(matrix_path)
-        matrix_name = matrix_path.stem  # Get filename without extension
-        print(f"Loaded forward matrix from: {matrix_path}")
-    
+        profile = load_profile(matrix_path)
+        # Store the profile directory so process_raw can locate .cube files
+        profile['_dir'] = matrix_path.parent
+        matrix_name = matrix_path.stem
+        n = len(profile['illuminants'])
+        ccts = [e['cct'] for e in profile['illuminants']]
+        print(f"Loaded profile: {matrix_path}")
+        print(f"  {n} illuminant(s): {ccts} K")
+
     # Process input
     input_path = Path(args.input)
-    
+
     if not input_path.exists():
         print(f"Error: Input not found: {input_path}", file=sys.stderr)
         sys.exit(1)
-    
-    # Collect RAW files
+
     raw_extensions = {'.nef', '.cr2', '.cr3', '.arw', '.dng', '.raw', '.orf', '.rw2', '.raf'}
-    
+
     if input_path.is_file():
         raw_files = [input_path]
     else:
@@ -297,21 +591,21 @@ Examples:
             if f.suffix.lower() in raw_extensions
         ]
         raw_files.sort()
-    
+
     if not raw_files:
         print("No RAW files found!", file=sys.stderr)
         sys.exit(1)
-    
+
     print(f"\nFound {len(raw_files)} RAW file(s)")
     print(f"Colorspace: {args.cs.upper()}")
     print("-" * 60)
-    
-    # Process each file
+
     for raw_file in raw_files:
         try:
             process_raw(
                 raw_file,
-                forward_matrix=forward_matrix,
+                profile=profile,
+                scene_cct=args.cct,
                 colorspace=args.cs,
                 output_dir=args.output,
                 matrix_name=matrix_name
@@ -319,9 +613,9 @@ Examples:
         except Exception as e:
             print(f"Error processing {raw_file.name}: {e}", file=sys.stderr)
             continue
-    
+
     print("-" * 60)
-    print(f"✓ Completed: {len(raw_files)} file(s)")
+    print(f"\u2713 Completed: {len(raw_files)} file(s)")
 
 
 if __name__ == '__main__':
