@@ -28,12 +28,23 @@ from colour import CCS_ILLUMINANTS, xy_to_XYZ
 def load_profile(matrix_path):
     """
     Load profile JSON. Returns the parsed profile dict.
-    Supports both new multi-illuminant format {"illuminants": [...]}
-    and legacy single-illuminant format {"forwardMatrix": ..., "jzazlut": ...}.
-    Always returns a dict with an "illuminants" list.
+    Supports three formats:
+      - type=spline: new spline format (loads .npz alongside)
+      - illuminants=[...]: multi/single illuminant format
+      - legacy: {forwardMatrix, jzazlut} wrapped into illuminants format
     """
+    matrix_path = Path(matrix_path)
+
     with open(matrix_path, 'r') as f:
         profile = json.load(f)
+
+    if profile.get('type') == 'spline':
+        npz_path = matrix_path.parent / profile['jzazlut']['spline_data']
+        data = np.load(str(npz_path))
+        profile['_lut_values']       = data['lut_values']        # (n, 65, 65, 65, 3) float32
+        profile['_mired_breakpoints'] = np.array(profile['mired_breakpoints'], dtype=np.float64)
+        profile['_fm_values']         = np.array(profile['forward_matrix_values'], dtype=np.float64)  # (n, 9)
+        return profile
 
     if 'illuminants' not in profile:
         # Legacy format: wrap in new structure using D50 CCT (5003K)
@@ -167,6 +178,41 @@ def estimate_scene_cct(raw, raw_path=None):
     return _estimate_cct_rawpy(raw)
 
 
+def _interpolate_spline(profile, cct):
+    """
+    Evaluate the spline profile at the given scene CCT.
+    Fits CubicSpline on the stored raw values and evaluates at the scene mired.
+    Returns (forward_matrix, jzazlut_config).
+    jzazlut_config contains a pre-built '_table' key (no .cube file needed).
+    """
+    from scipy.interpolate import CubicSpline
+
+    mired_bps = profile['_mired_breakpoints']
+    fm_values = profile['_fm_values']          # (n, 9)
+    lut_values = profile['_lut_values']        # (n, 65, 65, 65, 3) float32
+
+    mired = np.clip(1e6 / max(cct, 100.0), mired_bps[0], mired_bps[-1])
+
+    # Forward matrix: 9 splines
+    cs_fm = CubicSpline(mired_bps, fm_values)
+    fm = cs_fm(mired).reshape(3, 3)
+
+    # LUT: flatten spatial dims, fit all splines at once, then reshape
+    n = lut_values.shape[0]
+    lut_flat = lut_values.reshape(n, -1).astype(np.float64)
+    cs_lut = CubicSpline(mired_bps, lut_flat)
+    table = cs_lut(mired).reshape(lut_values.shape[1:])
+    table = np.clip(table, 0.0, 1.0)
+
+    jzazlut_config = {
+        'reference_luminance': profile['jzazlut']['reference_luminance'],
+        'domain':              profile['jzazlut']['domain'],
+        '_table':              table,
+    }
+
+    return fm, jzazlut_config
+
+
 def interpolate_for_cct(illuminants, cct):
     """
     Given a sorted list of illuminant dicts and a scene CCT,
@@ -238,7 +284,39 @@ def _denormalize_jab(norm, domain):
     return jab
 
 
-def apply_jzazbz_lut_blended(xyz_image, jzazlut_lo, jzazlut_hi, weight, profile_dir):
+# ─── Parallel LUT worker ─────────────────────────────────────────────
+
+def _lut_apply_worker(args):
+    """
+    Apply full JzAzBz LUT pipeline to a pixel chunk in a subprocess.
+    Module-level for macOS spawn compatibility.
+    Returns corrected (N, 3) XYZ array.
+    """
+    import numpy as _np
+
+    chunk, lut_table, ref_lum, domain, cat_d50_to_d65, cat_d65_to_d50 = args
+
+    from colour import XYZ_to_Jzazbz, Jzazbz_to_XYZ, LUT3D
+    from colour.algebra import table_interpolation_tetrahedral
+
+    lut = LUT3D(table=lut_table)
+
+    xyz_d65 = chunk @ cat_d50_to_d65.T
+    jab = XYZ_to_Jzazbz(xyz_d65 * ref_lum)
+
+    norm = _normalize_jab(jab, domain)
+    norm = _np.clip(norm, 0.0, 1.0)
+
+    corrected_norm = lut.apply(norm, interpolator=table_interpolation_tetrahedral)
+    corrected_norm = _np.clip(corrected_norm, 0.0, 1.0)
+
+    corrected_jab = _denormalize_jab(corrected_norm, domain)
+    corrected_d65 = Jzazbz_to_XYZ(corrected_jab) / ref_lum
+
+    return corrected_d65 @ cat_d65_to_d50.T
+
+
+def apply_jzazbz_lut_blended(xyz_image, jzazlut_lo, jzazlut_hi, weight, profile_dir=None):
     """
     Apply JzAzBz LUT correction with optional blending between two illuminant LUTs.
 
@@ -258,22 +336,28 @@ def apply_jzazbz_lut_blended(xyz_image, jzazlut_lo, jzazlut_hi, weight, profile_
     return (1.0 - weight) * corrected_lo + weight * corrected_hi
 
 
-def apply_jzazbz_lut(xyz_image, jzazlut_config, profile_dir):
+def apply_jzazbz_lut(xyz_image, jzazlut_config, profile_dir=None):
     """
     Apply JzAzBz LUT correction to an XYZ image (Y=1 for white).
+    Pixel array is split across all available CPU cores.
 
     xyz_image:      ndarray shape (H, W, 3) or (N, 3)
-    jzazlut_config: dict with keys 'file', 'reference_luminance', 'domain'
-    profile_dir:    Path — directory containing the .cube file
+    jzazlut_config: dict with 'reference_luminance', 'domain', and either
+                    '_table' (pre-built ndarray from spline eval) or
+                    'file' + profile_dir (path to .cube file)
+    profile_dir:    Path — directory containing the .cube file (not needed if '_table' present)
     """
+    import multiprocessing
+
     ref_lum = jzazlut_config['reference_luminance']
     domain  = jzazlut_config['domain']
 
-    cube_path = Path(profile_dir) / jzazlut_config['file']
-    lut = colour.read_LUT(str(cube_path))
+    if '_table' in jzazlut_config:
+        lut_table = jzazlut_config['_table'].astype(np.float64)
+    else:
+        cube_path = Path(profile_dir) / jzazlut_config['file']
+        lut_table = colour.read_LUT(str(cube_path)).table
 
-    # Bradford CAT matrices: D50 ↔ D65
-    # JzAzBz neutral axis aligns with D65; our XYZ is D50-adapted.
     _obs = 'CIE 1931 2 Degree Standard Observer'
     _d50 = xy_to_XYZ(CCS_ILLUMINANTS[_obs]['D50'])
     _d65 = xy_to_XYZ(CCS_ILLUMINANTS[_obs]['D65'])
@@ -283,24 +367,19 @@ def apply_jzazbz_lut(xyz_image, jzazlut_config, profile_dir):
     orig_shape = xyz_image.shape
     xyz_flat = xyz_image.reshape(-1, 3)
 
-    # D50 → D65, then absolute XYZ → JzAzBz
-    xyz_d65 = xyz_flat @ cat_d50_to_d65.T
-    jab = colour.XYZ_to_Jzazbz(xyz_d65 * ref_lum)
+    # Use one worker per 100K pixels, capped at cpu_count
+    n_workers = min(multiprocessing.cpu_count(), max(1, len(xyz_flat) // 100_000))
+    chunks = np.array_split(xyz_flat, n_workers, axis=0)
 
-    # Normalize to [0, 1], clip out-of-gamut
-    norm = _normalize_jab(jab, domain)
-    norm = np.clip(norm, 0.0, 1.0)
+    worker_args = [
+        (chunk, lut_table, ref_lum, domain, cat_d50_to_d65, cat_d65_to_d50)
+        for chunk in chunks
+    ]
 
-    # Apply LUT via tetrahedral interpolation
-    corrected_norm = lut.apply(norm, interpolator=table_interpolation_tetrahedral)
-    corrected_norm = np.clip(corrected_norm, 0.0, 1.0)
+    with multiprocessing.Pool(n_workers) as pool:
+        results = pool.map(_lut_apply_worker, worker_args)
 
-    # Denormalize → JzAzBz → absolute XYZ → D65 → D50
-    corrected_jab = _denormalize_jab(corrected_norm, domain)
-    corrected_d65 = colour.Jzazbz_to_XYZ(corrected_jab) / ref_lum
-    corrected_xyz = corrected_d65 @ cat_d65_to_d50.T
-
-    return corrected_xyz.reshape(orig_shape)
+    return np.concatenate(results, axis=0).reshape(orig_shape)
 
 def convert_xyz_to_aces_ap1_acescct(xyz):
     """Convert XYZ (D50) to ACES AP1 with ACEScct log encoding.
@@ -369,9 +448,8 @@ def process_raw(raw_path, profile=None, scene_cct=None,
     # Open RAW file
     with rawpy.imread(str(raw_path)) as raw:
 
-        # Resolve FM and LUT from multi-illuminant profile
+        # Resolve FM and LUT from profile
         if profile is not None:
-            illuminants = profile['illuminants']
             profile_dir = profile.get('_dir')
 
             if scene_cct is None:
@@ -379,13 +457,23 @@ def process_raw(raw_path, profile=None, scene_cct=None,
                 if scene_cct is not None:
                     print(f"  Estimated scene CCT: {scene_cct:.0f} K")
                 else:
-                    scene_cct = illuminants[0]['cct']
-                    print(f"  Could not estimate CCT, using {scene_cct} K")
+                    if profile.get('type') == 'spline':
+                        scene_cct = float(1e6 / np.mean(profile['_mired_breakpoints']))
+                    else:
+                        scene_cct = profile['illuminants'][0]['cct']
+                    print(f"  Could not estimate CCT, using {scene_cct:.0f} K")
             else:
                 print(f"  Scene CCT (manual override): {scene_cct:.0f} K")
 
-            forward_matrix, jzazlut_lo, jzazlut_hi, lut_weight = interpolate_for_cct(illuminants, scene_cct)
-            print(f"  Interpolated FM + LUT for {scene_cct:.0f} K (weight={lut_weight:.3f})")
+            if profile.get('type') == 'spline':
+                forward_matrix, jzazlut_lo = _interpolate_spline(profile, scene_cct)
+                jzazlut_hi = None
+                lut_weight = 0.0
+                print(f"  Spline-interpolated FM + LUT for {scene_cct:.0f} K")
+            else:
+                illuminants = profile['illuminants']
+                forward_matrix, jzazlut_lo, jzazlut_hi, lut_weight = interpolate_for_cct(illuminants, scene_cct)
+                print(f"  Interpolated FM + LUT for {scene_cct:.0f} K (weight={lut_weight:.3f})")
 
         else:
             forward_matrix = None
@@ -569,10 +657,17 @@ Examples:
         # Store the profile directory so process_raw can locate .cube files
         profile['_dir'] = matrix_path.parent
         matrix_name = matrix_path.stem
-        n = len(profile['illuminants'])
-        ccts = [e['cct'] for e in profile['illuminants']]
-        print(f"Loaded profile: {matrix_path}")
-        print(f"  {n} illuminant(s): {ccts} K")
+
+        if profile.get('type') == 'spline':
+            n = len(profile['mired_breakpoints'])
+            ccts_approx = [round(1e6 / m) for m in profile['mired_breakpoints']]
+            print(f"Loaded spline profile: {matrix_path}")
+            print(f"  {n} breakpoints — CCT range: {max(ccts_approx)}–{min(ccts_approx)} K")
+        else:
+            n = len(profile['illuminants'])
+            ccts = [e['cct'] for e in profile['illuminants']]
+            print(f"Loaded profile: {matrix_path}")
+            print(f"  {n} illuminant(s): {ccts} K")
 
     # Process input
     input_path = Path(args.input)
