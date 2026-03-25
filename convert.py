@@ -25,6 +25,77 @@ from colour.algebra import table_interpolation_tetrahedral
 from colour import CCS_ILLUMINANTS, xy_to_XYZ
 
 
+def _expand_poly_d3(rgb):
+    """
+    Degree-3 polynomial expansion of per-pixel RGB into 19 features.
+    Inline copy of poly_fm_lib.expand_poly_d3 — no external dependency.
+
+    rgb     : (N, 3) ndarray
+    Returns : (N, 19) ndarray
+
+    Term order: R, G, B,
+                R², G², B², RG, RB, GB,
+                R³, G³, B³, R²G, R²B, RG², G²B, RB², GB², RGB
+    """
+    R = rgb[:, 0]
+    G = rgb[:, 1]
+    B = rgb[:, 2]
+
+    return np.column_stack([
+        R, G, B,
+        R*R, G*G, B*B, R*G, R*B, G*B,
+        R*R*R, G*G*G, B*B*B,
+        R*R*G, R*R*B, R*G*G, G*G*B, R*B*B, G*B*B,
+        R*G*B,
+    ])
+
+
+def _expand_nn(rgb, mode='B', epsilon=0.005):
+    """
+    Neutral-null basis expansion of per-pixel RGB.
+    Inline copy of neutral_null_lib.expand_nn — no external dependency.
+
+    mode A — 17 terms: linear + degree-2 + degree-3 neutral-null
+    mode B — 19 terms: mode A + log(R/G), log(R/B)
+
+    rgb     : (N, 3) ndarray
+    Returns : (N, 17) or (N, 19) ndarray
+    """
+    R = rgb[:, 0]
+    G = rgb[:, 1]
+    B = rgb[:, 2]
+
+    cols = [R, G, B]
+
+    cols += [
+        R * (R - G),
+        R * (R - B),
+        G * (G - B),
+        G * (G - R),
+        B * (B - R),
+    ]
+
+    cols += [
+        R * R * (R - G),
+        R * R * (R - B),
+        G * G * (G - R),
+        G * G * (G - B),
+        B * B * (B - R),
+        B * B * (B - G),
+        R * G * (R - B),
+        R * B * (R - G),
+        G * B * (G - R),
+    ]
+
+    if mode == 'B':
+        cols += [
+            np.log((R + epsilon) / (G + epsilon)),
+            np.log((R + epsilon) / (B + epsilon)),
+        ]
+
+    return np.column_stack(cols)
+
+
 def load_profile(matrix_path):
     """
     Load profile JSON. Returns the parsed profile dict.
@@ -38,10 +109,11 @@ def load_profile(matrix_path):
     with open(matrix_path, 'r') as f:
         profile = json.load(f)
 
-    if profile.get('type') == 'spline':
-        npz_path = matrix_path.parent / profile['jzazlut']['spline_data']
-        data = np.load(str(npz_path))
-        profile['_lut_values']       = data['lut_values']        # (n, 65, 65, 65, 3) float32
+    if profile.get('type') == 'spline' and 'mired_breakpoints' in profile:
+        if 'jzazlut' in profile:
+            npz_path = matrix_path.parent / profile['jzazlut']['spline_data']
+            data = np.load(str(npz_path))
+            profile['_lut_values'] = data['lut_values']          # (n, 65, 65, 65, 3) float32
         profile['_mired_breakpoints'] = np.array(profile['mired_breakpoints'], dtype=np.float64)
         profile['_fm_values']         = np.array(profile['forward_matrix_values'], dtype=np.float64)  # (n, 9)
         return profile
@@ -189,26 +261,37 @@ def _interpolate_spline(profile, cct):
 
     mired_bps = profile['_mired_breakpoints']
     fm_values = profile['_fm_values']          # (n, 9)
-    lut_values = profile['_lut_values']        # (n, 65, 65, 65, 3) float32
+    lut_values = profile.get('_lut_values')    # (n, 65, 65, 65, 3) float32, or None
 
     mired = np.clip(1e6 / max(cct, 100.0), mired_bps[0], mired_bps[-1])
 
-    # Forward matrix: 9 splines
+    # Forward matrix: 9 splines (3x3), 57 splines (3x19 poly), or nn variant
+    is_nn   = profile.get('nn', False)
+    is_poly = profile.get('poly', False)
+    if is_nn:
+        n_terms = profile.get('nn_terms', 17)
+    elif is_poly:
+        n_terms = 19
+    else:
+        n_terms = 3
     cs_fm = CubicSpline(mired_bps, fm_values)
-    fm = cs_fm(mired).reshape(3, 3)
+    fm = cs_fm(mired).reshape(3, n_terms)
 
-    # LUT: flatten spatial dims, fit all splines at once, then reshape
-    n = lut_values.shape[0]
-    lut_flat = lut_values.reshape(n, -1).astype(np.float64)
-    cs_lut = CubicSpline(mired_bps, lut_flat)
-    table = cs_lut(mired).reshape(lut_values.shape[1:])
-    table = np.clip(table, 0.0, 1.0)
+    # LUT: only interpolate if the profile includes a jzazlut
+    if lut_values is not None:
+        n = lut_values.shape[0]
+        lut_flat = lut_values.reshape(n, -1).astype(np.float64)
+        cs_lut = CubicSpline(mired_bps, lut_flat)
+        table = cs_lut(mired).reshape(lut_values.shape[1:])
+        table = np.clip(table, 0.0, 1.0)
 
-    jzazlut_config = {
-        'reference_luminance': profile['jzazlut']['reference_luminance'],
-        'domain':              profile['jzazlut']['domain'],
-        '_table':              table,
-    }
+        jzazlut_config = {
+            'reference_luminance': profile['jzazlut']['reference_luminance'],
+            'domain':              profile['jzazlut']['domain'],
+            '_table':              table,
+        }
+    else:
+        jzazlut_config = None
 
     return fm, jzazlut_config
 
@@ -381,6 +464,14 @@ def apply_jzazbz_lut(xyz_image, jzazlut_config, profile_dir=None):
 
     return np.concatenate(results, axis=0).reshape(orig_shape)
 
+
+def _print_matrix(label, matrix):
+    """Print a 3x3 matrix in a readable CLI format."""
+    print(f"  {label}:")
+    for row in matrix:
+        print(f"    [{row[0]:+.6f}  {row[1]:+.6f}  {row[2]:+.6f}]")
+
+
 def convert_xyz_to_aces_ap1_acescct(xyz):
     """Convert XYZ (D50) to ACES AP1 with ACEScct log encoding.
 
@@ -457,7 +548,7 @@ def process_raw(raw_path, profile=None, scene_cct=None,
                 if scene_cct is not None:
                     print(f"  Estimated scene CCT: {scene_cct:.0f} K")
                 else:
-                    if profile.get('type') == 'spline':
+                    if profile.get('type') == 'spline' and '_mired_breakpoints' in profile:
                         scene_cct = float(1e6 / np.mean(profile['_mired_breakpoints']))
                     else:
                         scene_cct = profile['illuminants'][0]['cct']
@@ -465,15 +556,20 @@ def process_raw(raw_path, profile=None, scene_cct=None,
             else:
                 print(f"  Scene CCT (manual override): {scene_cct:.0f} K")
 
-            if profile.get('type') == 'spline':
+            if profile.get('type') == 'spline' and '_mired_breakpoints' in profile:
                 forward_matrix, jzazlut_lo = _interpolate_spline(profile, scene_cct)
                 jzazlut_hi = None
                 lut_weight = 0.0
                 print(f"  Spline-interpolated FM + LUT for {scene_cct:.0f} K")
+                if forward_matrix.shape[1] == 3:
+                    _print_matrix("Interpolated forward matrix", forward_matrix)
+                else:
+                    print(f"  Interpolated forward matrix: {forward_matrix.shape} (polynomial degree-3)")
             else:
                 illuminants = profile['illuminants']
                 forward_matrix, jzazlut_lo, jzazlut_hi, lut_weight = interpolate_for_cct(illuminants, scene_cct)
                 print(f"  Interpolated FM + LUT for {scene_cct:.0f} K (weight={lut_weight:.3f})")
+                _print_matrix("Interpolated forward matrix", forward_matrix)
 
         else:
             forward_matrix = None
@@ -521,7 +617,17 @@ def process_raw(raw_path, profile=None, scene_cct=None,
 
             print(f"  Using interpolated forward matrix")
             shape    = rgb_image.shape
-            xyz_flat = rgb_image.reshape(-1, 3) @ forward_matrix.T
+            rgb_flat = rgb_image.reshape(-1, 3)
+
+            if profile is not None and profile.get('nn', False):
+                nn_mode    = profile.get('nn_mode', 'A')
+                nn_epsilon = profile.get('nn_epsilon', 0.005)
+                xyz_flat = _expand_nn(rgb_flat, mode=nn_mode, epsilon=nn_epsilon) @ forward_matrix.T
+            elif forward_matrix.shape[1] == 19:
+                xyz_flat = _expand_poly_d3(rgb_flat) @ forward_matrix.T
+            else:
+                xyz_flat = rgb_flat @ forward_matrix.T
+
             xyz_image = xyz_flat.reshape(shape)
 
         else:
@@ -658,7 +764,7 @@ Examples:
         profile['_dir'] = matrix_path.parent
         matrix_name = matrix_path.stem
 
-        if profile.get('type') == 'spline':
+        if profile.get('type') == 'spline' and 'mired_breakpoints' in profile:
             n = len(profile['mired_breakpoints'])
             ccts_approx = [round(1e6 / m) for m in profile['mired_breakpoints']]
             print(f"Loaded spline profile: {matrix_path}")
