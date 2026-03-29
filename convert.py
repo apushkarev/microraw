@@ -21,7 +21,6 @@ import colour
 from colour import CCS_ILLUMINANTS, RGB_COLOURSPACES, xy_to_XYZ
 from colour.models import log_encoding_ACEScct
 from colour.adaptation import matrix_chromatic_adaptation_VonKries
-from colour.algebra import table_interpolation_tetrahedral
 from colour import CCS_ILLUMINANTS, xy_to_XYZ
 
 
@@ -367,6 +366,50 @@ def _denormalize_jab(norm, domain):
     return jab
 
 
+# ─── Catmull-Rom tricubic LUT interpolation ───────────────────────────────────
+
+def lut_interp_cr(points, lut):
+    """
+    Catmull-Rom tricubic LUT lookup (numpy, vectorized).
+    points : (N, 3) normalised [0, 1]
+    lut    : (S, S, S, 3)
+    Returns (N, 3)  — C1 smooth, 64 neighbours per point.
+    """
+    S      = lut.shape[0]
+    scaled = np.clip(points, 0.0, 1.0) * (S - 1)
+    ijk    = scaled.astype(int)
+    frac   = scaled - ijk
+
+    i0, j0, k0 = ijk[:, 0], ijk[:, 1], ijk[:, 2]
+
+    def _crw(t):
+        t2 = t * t
+        t3 = t2 * t
+        return np.stack([
+            -0.5*t3 + t2        - 0.5*t,
+             1.5*t3 - 2.5*t2            + 1.0,
+            -1.5*t3 + 2.0*t2    + 0.5*t,
+             0.5*t3 - 0.5*t2,
+        ], axis=1)
+
+    wi = _crw(frac[:, 0])
+    wj = _crw(frac[:, 1])
+    wk = _crw(frac[:, 2])
+
+    out = np.zeros((points.shape[0], 3))
+
+    for di in range(-1, 3):
+        ii = np.clip(i0 + di, 0, S - 1)
+        for dj in range(-1, 3):
+            jj = np.clip(j0 + dj, 0, S - 1)
+            for dk in range(-1, 3):
+                kk = np.clip(k0 + dk, 0, S - 1)
+                w  = (wi[:, di+1] * wj[:, dj+1] * wk[:, dk+1])[:, np.newaxis]
+                out += w * lut[ii, jj, kk]
+
+    return out
+
+
 # ─── Parallel LUT worker ─────────────────────────────────────────────
 
 def _lut_apply_worker(args):
@@ -379,10 +422,7 @@ def _lut_apply_worker(args):
 
     chunk, lut_table, ref_lum, domain, cat_d50_to_d65, cat_d65_to_d50 = args
 
-    from colour import XYZ_to_Jzazbz, Jzazbz_to_XYZ, LUT3D
-    from colour.algebra import table_interpolation_tetrahedral
-
-    lut = LUT3D(table=lut_table)
+    from colour import XYZ_to_Jzazbz, Jzazbz_to_XYZ
 
     xyz_d65 = chunk @ cat_d50_to_d65.T
     jab = XYZ_to_Jzazbz(xyz_d65 * ref_lum)
@@ -390,7 +430,7 @@ def _lut_apply_worker(args):
     norm = _normalize_jab(jab, domain)
     norm = _np.clip(norm, 0.0, 1.0)
 
-    corrected_norm = lut.apply(norm, interpolator=table_interpolation_tetrahedral)
+    corrected_norm = lut_interp_cr(norm, lut_table)
     corrected_norm = _np.clip(corrected_norm, 0.0, 1.0)
 
     corrected_jab = _denormalize_jab(corrected_norm, domain)
